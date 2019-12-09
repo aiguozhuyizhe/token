@@ -1,0 +1,236 @@
+from flask import Flask, request, current_app, jsonify
+from itsdangerous import TimedJSONWebSignatureSerializer as Serializer
+from DB import *
+import uuid
+import  hashlib
+from  decimal import *
+import  base64
+
+from gevent.pywsgi import  WSGIServer
+"<___________________>"
+app = Flask(__name__)
+
+#token的加密函数
+def generate_token(api_users):
+    expiration = 3600*8 #有效期/秒
+    #OTCD是加密参数
+    s = Serializer("OTCD", expires_in=expiration)
+    token = s.dumps({'id': api_users}).decode('ascii')
+    return token
+
+#token的解密验证函数
+def verify_auth_token(token):
+    s = Serializer("OTCD")
+    try:
+        data = s.loads(token)
+    except Exception as e:
+        return None
+    conn = db1()
+    sql = "select FAppUserID,FUserName,FPassword from OTCD_User where FAppUserID='{}'".format(data['id'])
+    UN = DBSelect(conn,sql)
+    for i in UN:
+        return i
+
+#用户登录函数
+@app.route('/user/login', methods=["GET", "POST"])
+def userlogin():
+    username = request.args.get('username')
+    password_out = request.args.get('password').encode('utf-8')
+    #password_in = hashlib.md5(password_out.encode(encoding="utf-8")).hexdigest()
+    #password_in  = base64.b64encode(password_out.encode('utf-8'))
+    if not all([username, password_out]) :
+        return jsonify(msg="请输入用户名和密码")
+    if len(username)!=11:
+        return  jsonify("请输入11位账号")
+    else:
+        conn = db1()
+        sql = "select FUserID, FUserCode,FUserPass from Dict_Users where FUserCode='{0}'".format(username)
+        user = DBSelect(conn,sql)       
+        for i in user:        
+            xl = base64.b64decode(i[2])
+            if xl != password_out:
+                return jsonify(msg="用户名或密码有误")
+            token = generate_token(i[0])
+            data = {
+                "username": i[1],
+                "access_token": token,
+            }
+            return jsonify(msg="登录成功", data=data)
+
+#用户信息功能函数
+@app.route("/user/info", methods=["GET","POST"])
+def userInfo():
+    token = request.headers.get('X-Headers')
+    user = verify_auth_token(token)  # 解码token获取用户信息FUsername
+    data = {
+        "username": user[1],
+    }
+    return jsonify(msg="成功", data=data)
+
+#当前查询
+@app.route("/user/balance",methods=["GET","POST"])
+def balance():
+    token = request.headers.get('X-Headers')
+    user = verify_auth_token(token)
+    conn = db1()
+    sql = "SELECT FAppUserID,getdate() as CurrTime, FOTCDBalance+Faward, FOTCDFroze, FOTCDBalance+Faward-FOTCDFroze FROM OTCD_User WHERE FAppUserID='{0}'".format(user[0])
+    information = DBSelect(conn,sql)
+    a = []
+    Balance = ("%.2f"%information[0][2])#总余额
+    Froze =("%.2f"%information[0][3]) #冻结余额
+    Available =("%.2f"%information[0][4])#可用余额
+    data = {
+        "总余额":Balance,
+        "冻结余额":Froze,
+        "可用余额":Available,
+    }
+
+    return jsonify(data=data)
+#申请记录
+@app.route("/user/apply_record",methods=["GET","POST"])
+def Apply_Record():
+    token = request.headers.get('X-Headers')
+    user = verify_auth_token(token)
+    conn = db1()
+    #             序号           ID          账号     审核状态T,F   申请时间    金额              收款人姓名      身份证号     开户行      银行类型  状态
+    sql = "SELECT FWidthdrawID,FAppUserID,FIdCardNo,FIsConfirmed,FCreateTime,FWidthdrawAmount,FBankAccountName,FBankAccount,FBankBranch,FBankName,FStatus FROM OTCD_Widthdraw WHERE FAppUserID='{0}' ORDER BY FCreateTime DESC".format(user[0])
+    information = DBSelect(conn,sql)
+    a = []
+    for i in information:
+        Num =i[0]#序号
+        Status = i[10]
+        Confirmed_Status =i[3]#审核状态
+        Time = i[4]#申请时间
+        Balance = ("%.2f"%i[5])#金额
+        Payee_Name = i[6]#收款人姓名
+        ID_Num = i[2]#身份证号
+        Bank_type = i[9]#银行类型
+        Account = i[7]#账号
+        Branch = i[8]
+        data = {
+            "序号":Num ,
+            "审核状态":Confirmed_Status,
+            "状态":Status,
+            "申请时间":Time,
+            "金额":Balance,
+            "收款人姓名":Payee_Name,
+            "身份证号码":ID_Num,
+            "银行类型":Bank_type,
+            "账号":Account,
+            "开户行":Branch,
+        }
+        a.append(data)
+    return jsonify(data=a)
+
+#结算记录
+@app.route("/user/settlement_record",methods=["GET","POST"])
+def Settlement_Record():
+    token = request.headers.get('X-Headers')
+    user = verify_auth_token(token)
+    conn =db1()
+    sql = "SELECT FAmountConfirmed, FTimeConfirmed FROM OTCD_V_ORDER WHERE FSellerID='{0}'and FStatus=2 and FCurrency='OTCD'ORDER BY FTimeConfirmed DESC".format(user[0])
+    information = DBSelect(conn, sql)
+    a =[]
+    for i in information:
+        Settlement_Balance = ("%.2f" % i[0])  # 结算金额
+        Time = i[1]
+        data = {
+            "结算金额":Settlement_Balance,
+            "到账时间":Time
+        }
+        a.append(data)
+    return jsonify(data=a)
+
+
+#交易流水
+@app.route("/user/trading_flow",methods=["GET","POST"])
+def Trading_Flow():
+    token = request.headers.get('X-Headers')
+    user = verify_auth_token(token)
+    conn =db1()
+    sql = "SELECT 'S'+ FOrderNo AS FOrderNo, FBusinessNo, FPayMethod,  FFee,  FAmount, FAmountConfirmed,  FStatus, FCreateTime,FWeChatNickName,FAliPayNickName FROM OTCD_V_ORDER WHERE FCurrency='OTCD' and FStatus=2  and FBuyerID='{0}'  ORDER BY FTimeConfirmed DESC ".format(user[0])
+    information = DBSelect(conn, sql)
+    a = []
+    for i in information:
+        Order_ID =i[0]#单号
+        trading_flow_id = i[1]#交易流水号
+        Status = i[6]#状态
+        Paymethod = i[2]#支付通道
+        Amount =("%.2f" %i[4])#订单金额
+        Amount_Confirmed = ("%.2f" %i[5])#到账金额
+        Charge = ("%.2f" %i[3])#手续费
+        Time = i[7]#时间
+        data = {
+            "单号":Order_ID,
+            "交易流水":trading_flow_id,
+            "状态":Status,
+            "支付通道":Paymethod,
+            "订单金额":Amount,
+            "到账金额":Amount_Confirmed,
+            "手续费":Charge,
+            "时间":Time,
+        }
+        a.append(data)
+    return jsonify(data=a)
+
+#接口参数
+@app.route("/user/interface_params",methods=["GET","POST"])
+def Interface_Params():
+    token = request.headers.get('X-Headers')
+    user = verify_auth_token(token)
+    conn =db1()
+    sql = "SELECT FAppUserID, FApiKey FROM OTCD_User WHERE FAppUserID='{0}'".format(user[0])
+    information = DBSelect(conn, sql)
+    BuinessID = information[0][0]#商户ID
+    Api_key = information[0][1]#商户私钥
+    data = {
+        "商户ID":BuinessID,
+        "商户私钥":Api_key,
+    }
+    return  jsonify(data=data)
+#新增申请
+@app.route('/user/add_apply', methods=["GET", "POST"])
+def Add_Apply():
+    WidthdrawID = "".join(str(uuid.uuid4()).split("-")).upper()
+    token = request.headers.get('X-Headers')
+    user = verify_auth_token(token)
+    AppUserID = user[0]#会员姓名
+    PayMethod = request.args.get('paymethod')#收款方式
+    BankName = request.args.get('bankname')#银行类型
+    BankAccountName = request.args.get('bankaccountname')#收款人姓名
+    BankAccount = request.args.get('bankaccount')#银行账号
+    BankBranch = request.args.get('bankbranch')#开户行
+    IdCardNo = request.args.get('idcardno')#身份证号
+    WidthdrawAmount = request.args.get('widthdrawamount')#金额
+    print(type(WidthdrawAmount))
+    if AppUserID == "":
+        return jsonify("查无此用户")
+    if PayMethod == "":
+        return jsonify("请选择收款方式")
+    if BankName == "":
+        return  jsonify("请输入银行类型")
+    if BankAccountName == "":
+        return jsonify("请填写收款人姓名")
+    if BankAccount == "":
+        return jsonify("请填写银行账号")
+    if BankBranch == "":
+        return  jsonify("请填写开户行")
+    if IdCardNo =="" or len(IdCardNo)>18:
+        return  jsonify("请输入身份证号或者填写18位正确身份证号")
+    if WidthdrawAmount == "":
+        return  jsonify("请输入金额")
+
+
+    FType = '1'
+    conn = db1()
+    sql = "insert into OTCD_Widthdraw (FType,FWidthdrawID,FAppUserID,FPayMethod,FBankName ,FBankAccountName,FBankAccount,FBankBranch ,FIdCardNo,FWidthdrawAmount) values ('{0}','{1}','{2}','{3}','{4}','{5}','{6}','{7}','{8}','{9}')".format(FType,WidthdrawID,AppUserID,PayMethod,BankName,BankAccountName,BankAccount,BankBranch,IdCardNo,WidthdrawAmount)
+    if Insert(conn,sql) ==True:
+        return "成功"
+    else:
+        return "失败"
+
+
+if __name__ == '__main__':
+
+    #serve(app,host="172.31.103.220", port=8123)
+    WSGIServer(('172.18.27.106', 8994), app).serve_forever()
